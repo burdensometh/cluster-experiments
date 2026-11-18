@@ -1,8 +1,10 @@
 import logging
+import random
 import warnings
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -15,7 +17,14 @@ from cluster_experiments.relative_lift_transformer import (
     RegressionResultsProtocol,
 )
 from cluster_experiments.synthetic_control_utils import get_w
-from cluster_experiments.utils import HypothesisEntries, ModelResults
+from cluster_experiments.utils import (
+    HypothesisEntries,
+    ModelResults,
+    _original_time_column,
+)
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from cluster_experiments.random_splitter import RandomSplitter
 
 
 @dataclass
@@ -144,6 +153,281 @@ class InferenceResults:
             lines.append("Model fit:")
             lines.append(model_str)
         return "\n".join(lines)
+
+
+@dataclass
+class RandomizationInferenceResults:
+    """Results of a randomization (permutation) inference test.
+
+    Randomization inference tests the sharp null hypothesis that the treatment
+    has no effect on any unit. Under that null, every *legal* re-assignment of
+    the treatment that the experimental design could have produced is equally
+    plausible, so the observed statistic is compared against the statistics
+    obtained by re-running the **same analysis** on **legally re-assigned**
+    data.
+
+    The reported p-value uses a finite number of randomizations ``R`` and the
+    convention that the observed statistic is one extra reference draw, so the
+    p-value can never be zero:
+
+    * ``greater``: ``p = (1 + #{null >= observed}) / (1 + R)``
+    * ``less``: ``p = (1 + #{null <= observed}) / (1 + R)``
+    * ``two-sided``: ``p = (1 + #{|null| >= |observed|}) / (1 + R)``
+
+    Ties (null statistics exactly equal to the observed statistic) **count as
+    extreme**, and for one-sided hypotheses only the requested tail is used.
+    Because ``R`` is finite, the p-value is bounded below by ``1 / (1 + R)``.
+
+    Attributes:
+        observed_statistic: Statistic computed on the observed data.
+        p_value: Randomization-inference p-value (see the rule above).
+        null_statistics: Statistics from every legal re-assignment.
+        n_randomizations: Number of finite legal re-assignments ``R``.
+        n_extreme: How many null statistics are at least as extreme as the
+            observed one (ties included).
+        n_ties: How many null statistics are exactly equal to the observed one.
+        hypothesis: One of ``"two-sided"``, ``"less"``, ``"greater"``.
+        alpha: Significance level stored for reporting purposes.
+        statistic_name: Name of the statistic used (defaults to ``"ate"``).
+        n_failed_randomizations: Number of re-assignments discarded because the
+            statistic was undefined (e.g. a single arm) or non-finite.
+    """
+
+    observed_statistic: float
+    p_value: float
+    null_statistics: np.ndarray
+    n_randomizations: int
+    n_extreme: int
+    n_ties: int
+    hypothesis: str
+    alpha: float = 0.05
+    statistic_name: str = "ate"
+    n_failed_randomizations: int = 0
+
+    @property
+    def ate(self) -> float:
+        """Alias for the observed statistic (the analysis point estimate)."""
+        return self.observed_statistic
+
+    @property
+    def p_value_rule(self) -> str:
+        """Human-readable statement of the finite-randomization p-value rule."""
+        tail = {
+            HypothesisEntries.GREATER.value: "null statistics >= observed",
+            HypothesisEntries.LESS.value: "null statistics <= observed",
+            HypothesisEntries.TWO_SIDED.value: "|null statistics| >= |observed|",
+        }[HypothesisEntries(self.hypothesis).value]
+        return (
+            f"p = (1 + #{{{tail}, ties included}}) / (1 + R) with "
+            f"R = {self.n_randomizations} finite randomizations"
+        )
+
+    def summary(self) -> str:
+        """Return a summary of the randomization-inference test."""
+        return "\n".join(
+            [
+                "Randomization inference results",
+                f"  Observed statistic: {self.observed_statistic:.6g}",
+                f"  Hypothesis: {self.hypothesis}",
+                f"  Randomizations: {self.n_randomizations}",
+                f"  Extreme (ties included): {self.n_extreme}",
+                f"  Ties: {self.n_ties}",
+                f"  p-value: {self.p_value:.6g}",
+                f"  Rule: {self.p_value_rule}",
+            ]
+        )
+
+
+@dataclass
+class RandomizationInferenceConfig:
+    """Configuration for a randomization-inference test.
+
+    It bundles the experimental design (through ``splitter``) with the finite
+    number of randomizations, the random seed and the alternative hypothesis.
+
+    Attributes:
+        splitter: The configured :class:`~cluster_experiments.random_splitter.RandomSplitter`
+            that describes the legal treatment assignment mechanism. It is used
+            to generate every null re-assignment, so its cluster, stratification
+            and washover rules are respected.
+        n_randomizations: Number of finite legal re-assignments to draw.
+        seed: Seed for the random source. When set, the whole test is
+            reproducible and the caller's global random state is restored.
+        hypothesis: One of ``"two-sided"``, ``"less"``, ``"greater"``. Defaults
+            to the analysis' hypothesis.
+        control: Name of the control treatment. Defaults to the only non-treated
+            treatment of the splitter.
+        statistic: Either ``"ate"`` (default) or a callable ``df -> float``.
+        alpha: Significance level stored with the results.
+        prepare_df: Optional callable applied to every frame (observed and
+            re-assigned) right before the statistic is computed, after the rows
+            are restricted to the control/treatment pair. Used by
+            :class:`~cluster_experiments.inference.analysis_plan.AnalysisPlan`
+            to restrict each test to a dimension slice while the splitter still
+            re-assigns the full design.
+    """
+
+    splitter: Any
+    n_randomizations: int = 1000
+    seed: Optional[int] = None
+    hypothesis: Optional[str] = None
+    control: Optional[str] = None
+    statistic: Optional[Any] = None
+    alpha: Optional[float] = None
+    prepare_df: Optional[Callable[[pd.DataFrame], pd.DataFrame]] = None
+
+    def __post_init__(self):
+        if self.splitter is None:
+            raise ValueError("splitter is required for randomization inference")
+        if not isinstance(self.n_randomizations, int) or self.n_randomizations < 1:
+            raise ValueError(
+                "n_randomizations must be a positive integer, "
+                f"got {self.n_randomizations!r}"
+            )
+        if self.hypothesis is not None:
+            HypothesisEntries(self.hypothesis)  # validates the value
+        if not (
+            self.statistic is None
+            or self.statistic == "ate"
+            or callable(self.statistic)
+        ):
+            raise ValueError(
+                "statistic must be 'ate' or a callable, " f"got {self.statistic!r}"
+            )
+        if self.prepare_df is not None and not callable(self.prepare_df):
+            raise ValueError("prepare_df must be a callable if provided")
+
+
+@contextmanager
+def temporary_random_seed(seed: Optional[int]):
+    """Run a block with a fixed random source, restoring the caller's state.
+
+    Splitters draw from both the global ``random`` module and NumPy's legacy
+    global state (``pandas.DataFrame.sample`` and ``np.random.permutation``),
+    so both are seeded and both are restored afterwards. This makes
+    randomization inference reproducible without leaking global state.
+    """
+    if seed is None:
+        yield
+        return
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    random.seed(seed)
+    np.random.seed(seed)
+    try:
+        yield
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+
+
+def randomization_p_value(
+    null_statistics: np.ndarray, observed_statistic: float, hypothesis: str
+) -> Tuple[float, int, int]:
+    """Finite-randomization p-value, extreme count and tie count.
+
+    The observed statistic is treated as one extra reference draw, hence the
+    ``+ 1`` in both numerator and denominator. Ties (null statistics equal to
+    the observed one up to floating-point tolerance) count as extreme, and for
+    one-sided hypotheses only the requested tail is used.
+    """
+    null_statistics = np.asarray(null_statistics, dtype=float)
+    observed_statistic = float(observed_statistic)
+    # Equivalence tolerance so that numerically identical statistics (e.g. from
+    # degenerate designs) are counted as ties and as extreme values.
+    rtol = 1e-12 if observed_statistic == 0 else 1e-9
+
+    def ties(values: np.ndarray) -> np.ndarray:
+        return np.isclose(values, observed_statistic, rtol=rtol, atol=0.0)
+
+    tie_mask = ties(null_statistics)
+    if HypothesisEntries(hypothesis) == HypothesisEntries.GREATER:
+        extreme_mask = (null_statistics >= observed_statistic) | tie_mask
+    elif HypothesisEntries(hypothesis) == HypothesisEntries.LESS:
+        extreme_mask = (null_statistics <= observed_statistic) | tie_mask
+    elif HypothesisEntries(hypothesis) == HypothesisEntries.TWO_SIDED:
+        extreme_mask = (
+            np.abs(null_statistics) >= abs(observed_statistic)
+        ) | np.isclose(
+            np.abs(null_statistics), abs(observed_statistic), rtol=rtol, atol=0.0
+        )
+    else:
+        raise ValueError(f"{hypothesis} is not a valid HypothesisEntries")
+
+    n_extreme = int(extreme_mask.sum())
+    n_ties = int(tie_mask.sum())
+    n_randomizations = int(null_statistics.size)
+    p_value = (1 + n_extreme) / (1 + n_randomizations)
+    return p_value, n_extreme, n_ties
+
+
+def prepare_observed_with_splitter(
+    df: pd.DataFrame, splitter: "RandomSplitter"
+) -> pd.DataFrame:
+    """Apply the splitter's deterministic preparation to observed data.
+
+    Falls back to a copy when the splitter does not implement
+    ``prepare_observed_df`` (e.g. a user-defined splitter from an older
+    version), which keeps randomization inference usable with third-party
+    splitters.
+    """
+    prepare = getattr(splitter, "prepare_observed_df", None)
+    if callable(prepare):
+        return prepare(df)
+    return df.copy()
+
+
+def compute_randomization_statistics(
+    df: pd.DataFrame,
+    splitter: "RandomSplitter",
+    statistic_fn: Callable[[pd.DataFrame], float],
+    n_randomizations: int,
+    seed: Optional[int],
+    treatment_col: str = "treatment",
+) -> Tuple[float, np.ndarray, int, Optional[str]]:
+    """Observed statistic plus the null distribution from legal re-assignments.
+
+    ``df`` must contain the design columns **and** the observed treatment in
+    ``treatment_col``. The observed statistic is computed on ``df`` after the
+    splitter's deterministic preparation. Null re-assignments are generated by
+    the splitter from a copy of ``df`` with the observed treatment removed, so
+    the design's own assignment mechanism (clusters, strata, washover) is the
+    only thing that determines the labels. ``statistic_fn`` is applied unchanged
+    to the observed data and to every re-assigned dataset.
+
+    Returns ``(observed_statistic, null_statistics, n_failed, last_failure)``.
+    Re-assignments whose statistic is undefined raise inside ``statistic_fn``
+    and are counted as failures rather than aborting the whole test.
+    """
+    reassignment_input = df.drop(columns=[treatment_col])
+    with temporary_random_seed(seed):
+        observed_df = prepare_observed_with_splitter(df, splitter)
+        observed_statistic = statistic_fn(observed_df)
+
+        null_statistics: List[float] = []
+        n_failed = 0
+        last_failure: Optional[str] = None
+        for _ in range(n_randomizations):
+            reassigned_df = splitter.assign_treatment_df(reassignment_input)
+            if len(reassigned_df) > len(df):
+                raise ValueError(
+                    "The splitter returned more rows than it received, so it is "
+                    "not a legal one-assignment-per-row mechanism (RepeatedSampler "
+                    f"and similar splitters cannot be used): {len(reassigned_df)} "
+                    f"rows for {len(df)} inputs."
+                )
+            try:
+                null_statistics.append(statistic_fn(reassigned_df))
+            except (ValueError, AssertionError, ZeroDivisionError) as exc:
+                n_failed += 1
+                last_failure = str(exc)
+
+    return (
+        observed_statistic,
+        np.asarray(null_statistics, dtype=float),
+        n_failed,
+        last_failure,
+    )
 
 
 class ExperimentAnalysis(ABC):
@@ -428,6 +712,293 @@ class ExperimentAnalysis(ABC):
         self._data_checks(df=df)
         return self.analysis_inference_results(df, alpha)
 
+    def _get_randomization_control(
+        self, splitter: "RandomSplitter", control: Optional[str]
+    ) -> str:
+        """Resolve the control label used to build the binary contrast."""
+        if control is not None:
+            if control == self.treatment:
+                raise ValueError(
+                    "control and treatment must be different for randomization "
+                    f"inference, both are {control!r}"
+                )
+            return control
+        treatments = list(getattr(splitter, "treatments", None) or [])
+        candidates = [t for t in treatments if t != self.treatment]
+        if len(candidates) == 1:
+            return candidates[0]
+        if not candidates:
+            raise ValueError(
+                f"Could not infer a control different from treatment "
+                f"{self.treatment!r} "
+                f"from splitter treatments {treatments}. Pass control explicitly."
+            )
+        raise ValueError(
+            f"Could not infer a unique control from splitter treatments {treatments}; "
+            f"pass control explicitly."
+        )
+
+    def _validate_randomization_arms(
+        self, df: pd.DataFrame, treatments: List[str], control: str
+    ) -> None:
+        """Check that the splitter can reproduce the observed experiment arms.
+
+        Randomization inference compares the observed contrast with contrasts
+        from designs the splitter can generate. If the observed data contains
+        arms outside ``splitter.treatments``, the two sides would describe
+        different experiments, so it is rejected rather than silently producing
+        an invalid p-value.
+        """
+        if not treatments:
+            return
+        observed_arms = set(df[self.treatment_col].dropna().unique())
+        unexpected = observed_arms - set(treatments)
+        if unexpected:
+            raise ValueError(
+                f"Observed treatment labels {sorted(unexpected)} are not among the "
+                f"splitter treatments {treatments}. Randomization inference can only "
+                "compare against re-assignments the design could have produced."
+            )
+        if control not in treatments:
+            raise ValueError(
+                f"control {control!r} is not one of the splitter treatments "
+                f"{treatments}; the observed contrast is not a design arm."
+            )
+
+    def _randomization_base_df(
+        self, df: pd.DataFrame, splitter: "RandomSplitter"
+    ) -> pd.DataFrame:
+        """Build the data both the observed and null statistics start from.
+
+        All design rows are kept, because the legal assignment mechanism acts on
+        the whole design (a cluster or a time period may belong to a third arm
+        in a multi-arm experiment). The control/treatment contrast is applied
+        later, identically, by ``_randomization_transform`` on both sides.
+
+        When the splitter already stored the original time column, the raw time
+        column is restored so running the splitter again is idempotent.
+        """
+        base_df = df.reset_index(drop=True)
+        time_col = getattr(splitter, "time_col", None)
+        if time_col is not None:
+            original_time_col = _original_time_column(time_col)
+            if original_time_col in base_df.columns:
+                base_df = base_df.assign(**{time_col: base_df[original_time_col]})
+        return base_df
+
+    def _randomization_transform(
+        self,
+        frame: pd.DataFrame,
+        control: str,
+        config: RandomizationInferenceConfig,
+    ) -> pd.DataFrame:
+        """Restrict to the contrast rows and apply the optional ``prepare_df``.
+
+        This is the single place where "data preparation" happens, so the
+        observed statistic and every null statistic are computed on data built
+        by the same steps.
+        """
+        prepared = frame.loc[
+            frame[self.treatment_col].isin([control, self.treatment])
+        ].reset_index(drop=True)
+        if config.prepare_df is not None:
+            prepared = config.prepare_df(prepared)
+        return prepared
+
+    def _randomization_statistic(
+        self,
+        prepared_df: pd.DataFrame,
+        statistic: Optional[Callable[[pd.DataFrame], float]],
+    ) -> float:
+        """Compute one statistic with the analysis' own definition.
+
+        The default statistic is :meth:`get_point_estimate`, i.e. exactly the
+        point estimate the analysis reports on the observed data. A custom
+        callable receives the same filtered dataframe. ``NaN`` and infinite
+        values are treated as invalid re-assignments by the caller.
+        """
+        if statistic is None or statistic == "ate":
+            return float(self.get_point_estimate(prepared_df))
+        return float(statistic(prepared_df.copy()))
+
+    def get_randomization_inference(
+        self,
+        df: pd.DataFrame,
+        config: RandomizationInferenceConfig,
+        alpha: Optional[float] = None,
+    ) -> RandomizationInferenceResults:
+        """Randomization (permutation) inference using the design's splitter.
+
+        The observed statistic is computed on the data prepared by the same
+        splitter rules (time truncation for switchback, washover row dropping),
+        and every null statistic is computed by re-running the **same analysis
+        definition** on data re-assigned by the splitter. Because the splitter
+        is reused, cluster-level assignment, stratification and washover rules
+        all apply to the null distribution: unit-level labels are never shuffled
+        independently of their cluster.
+
+        The p-value uses a finite number of randomizations and never reaches
+        zero:
+
+        * ``greater``: ``(1 + #{null >= observed}) / (1 + R)``
+        * ``less``: ``(1 + #{null <= observed}) / (1 + R)``
+        * ``two-sided``: ``(1 + #{|null| >= |observed|}) / (1 + R)``
+
+        Ties count as extreme. Re-assignments that yield a degenerate statistic
+        (e.g. a single arm) are discarded and reported in
+        ``n_failed_randomizations``; ``R`` is the number of valid ones.
+
+        Arguments:
+            df: dataframe with the observed treatment and outcome (raw data, or
+                data already processed by the same splitter; processing is
+                idempotent).
+            config: randomization-inference configuration, including the
+                splitter that defines the legal assignment mechanism.
+            alpha: significance level stored with the results (defaults to the
+                config's ``alpha``, then ``0.05``).
+
+        Returns:
+            RandomizationInferenceResults with the observed statistic, the null
+            distribution and the finite-randomization p-value.
+
+        Usage:
+        ```python
+        import pandas as pd
+
+        from cluster_experiments import (
+            ClusteredOLSAnalysis,
+            ClusteredSplitter,
+            RandomizationInferenceConfig,
+        )
+
+        df = pd.DataFrame(
+            {
+                "cluster": [f"c{i}" for i in range(24) for _ in range(4)],
+                "treatment": [
+                    "A" if i % 2 == 0 else "B" for i in range(24) for _ in range(4)
+                ],
+                "target": [
+                    1.0 + (0.3 if i % 2 == 0 else 0.0) + 0.1 * j
+                    for i in range(24)
+                    for j in range(4)
+                ],
+            }
+        )
+        splitter = ClusteredSplitter(
+            cluster_cols=["cluster"], treatment_col="treatment", treatments=["A", "B"]
+        )
+        analysis = ClusteredOLSAnalysis(
+            cluster_cols=["cluster"], target_col="target", treatment="B"
+        )
+        results = analysis.get_randomization_inference(
+            df,
+            RandomizationInferenceConfig(
+                splitter=splitter, n_randomizations=100, seed=0
+            ),
+        )
+        print(results.p_value)
+        ```
+        """
+        splitter = config.splitter
+        if self.treatment_col not in df.columns:
+            raise ValueError(
+                f"Randomization inference needs the observed assignment in column "
+                f"{self.treatment_col!r}. Assign the experiment first (for example "
+                "with `splitter.assign_treatment_df`) and pass that data."
+            )
+        if getattr(splitter, "treatment_col", self.treatment_col) != self.treatment_col:
+            raise ValueError(
+                "The splitter must assign the same column the analysis reads: "
+                f"splitter.treatment_col={getattr(splitter, 'treatment_col', None)!r} "
+                f"but analysis.treatment_col={self.treatment_col!r}."
+            )
+
+        hypothesis = config.hypothesis or self.hypothesis
+        HypothesisEntries(hypothesis)  # validate
+        treatments = list(getattr(splitter, "treatments", None) or [])
+        if treatments and self.treatment not in treatments:
+            raise ValueError(
+                f"analysis treatment {self.treatment!r} is not one of the splitter "
+                f"treatments {treatments}; the null re-assignments would never "
+                "produce the treatment label under test"
+            )
+        control = self._get_randomization_control(splitter, config.control)
+        # The design must be able to reproduce the observed assignment's arms;
+        # otherwise the observed rows under the contrast and the re-assigned
+        # rows would describe different experiments.
+        self._validate_randomization_arms(df, treatments, control)
+        resolved_alpha = (
+            alpha
+            if alpha is not None
+            else (config.alpha if config.alpha is not None else 0.05)
+        )
+        statistic = config.statistic
+        statistic_name = "ate" if statistic in (None, "ate") else "custom"
+
+        base_df = self._randomization_base_df(df, splitter=splitter)
+
+        def compute_statistic(frame: pd.DataFrame) -> float:
+            prepared = self._randomization_transform(
+                frame, control=control, config=config
+            )
+            if prepared[self.treatment_col].nunique() < 2:
+                raise ValueError(
+                    "re-assignment produced a single arm; statistic undefined"
+                )
+            try:
+                value = self._randomization_statistic(prepared, statistic)
+            except NotImplementedError as exc:
+                raise ValueError(
+                    "This analysis does not implement a point estimate, which is "
+                    "the default randomization-inference statistic. Pass "
+                    "`statistic` as a callable (df -> float)."
+                ) from exc
+            if not np.isfinite(value):
+                raise ValueError("re-assignment produced a non-finite statistic")
+            return value
+
+        observed_statistic, null_array, n_failed, last_failure = (
+            compute_randomization_statistics(
+                base_df,
+                splitter=splitter,
+                statistic_fn=compute_statistic,
+                n_randomizations=config.n_randomizations,
+                seed=config.seed,
+                treatment_col=self.treatment_col,
+            )
+        )
+
+        n_randomizations = int(null_array.size)
+        if n_randomizations == 0:
+            raise ValueError(
+                "No valid randomization was produced by the splitter; "
+                f"{n_failed} attempts failed. Last error: {last_failure}"
+            )
+        if n_failed:
+            warnings.warn(
+                f"{n_failed} of {config.n_randomizations} legal re-assignments "
+                f"produced an undefined statistic and were discarded. Last error: "
+                f"{last_failure}",
+                stacklevel=2,
+            )
+
+        p_value, n_extreme, n_ties = randomization_p_value(
+            null_array, observed_statistic, hypothesis
+        )
+
+        return RandomizationInferenceResults(
+            observed_statistic=observed_statistic,
+            p_value=p_value,
+            null_statistics=null_array,
+            n_randomizations=n_randomizations,
+            n_extreme=n_extreme,
+            n_ties=n_ties,
+            hypothesis=hypothesis,
+            alpha=resolved_alpha,
+            statistic_name=statistic_name,
+            n_failed_randomizations=n_failed,
+        )
+
     def pvalue_based_on_hypothesis(
         self, model_result: RegressionResultsProtocol
     ) -> float:  # todo add typehint statsmodels result
@@ -681,6 +1252,29 @@ class TTestClusteredAnalysis(ExperimentAnalysis):
         )
         return t_test_results.pvalue
 
+    def analysis_point_estimate(self, df: pd.DataFrame, verbose: bool = False) -> float:
+        """Returns the difference in cluster-level means (treatment - control).
+
+        This is the natural statistic for randomization inference on this
+        analysis: it uses the same cluster aggregation as the t-test.
+
+        Arguments:
+            df: dataframe containing the data to analyze
+            verbose (Optional): bool, prints the cluster table if True
+        """
+        df_grouped = df.groupby(
+            self.cluster_cols + [self.treatment_col], as_index=False
+        )[self.target_col].mean()
+
+        treatment_data = df_grouped.query(f"{self.treatment_col} == 1")[self.target_col]
+        control_data = df_grouped.query(f"{self.treatment_col} == 0")[self.target_col]
+        assert len(treatment_data), "treatment data should have more than 1 cluster"
+        assert len(control_data), "control data should have more than 1 cluster"
+        if verbose:
+            print(f"cluster-level means (treatment):\n{treatment_data.describe()}")
+            print(f"cluster-level means (control):\n{control_data.describe()}")
+        return float(treatment_data.mean() - control_data.mean())
+
     @classmethod
     def from_config(cls, config):
         """Creates a TTestClusteredAnalysis object from a PowerConfig object"""
@@ -799,6 +1393,16 @@ class PairedTTestClusteredAnalysis(ExperimentAnalysis):
             print(f"paired t test results: \n {t_test_results} \n")
 
         return t_test_results.pvalue
+
+    def analysis_point_estimate(self, df: pd.DataFrame, verbose: bool = False) -> float:
+        """Returns the mean paired difference used by the paired t-test.
+
+        Arguments:
+            df: dataframe containing the data to analyze
+            verbose (Optional): bool, prints the paired pivot table if True
+        """
+        df_pivot = self._preprocessing(df=df, verbose=verbose)
+        return float((df_pivot.iloc[:, 1] - df_pivot.iloc[:, 0]).mean())
 
     @classmethod
     def from_config(cls, config):

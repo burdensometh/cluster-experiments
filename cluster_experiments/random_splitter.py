@@ -48,6 +48,23 @@ class RandomSplitter(ABC):
             df: dataframe to assign treatments to
         """
 
+    def prepare_observed_df(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Prepare a dataframe that already has the observed treatment assignment.
+
+        This applies every deterministic data-preparation rule of the splitter
+        (for example, truncating the time column and dropping washover rows in a
+        switchback design) **without** drawing a new random assignment. It is
+        used by randomization inference so that the observed test statistic is
+        computed on exactly the same kind of data as every null statistic.
+
+        The base implementation is a no-op: splitters that do not transform the
+        dataframe before assigning treatments return a copy of ``df``.
+
+        Arguments:
+            df: dataframe with the observed treatment column
+        """
+        return df.copy()
+
     @classmethod
     def from_config(cls, config):
         """Creates a RandomSplitter from a PowerConfig"""
@@ -194,7 +211,12 @@ class SwitchbackSplitter(ClusteredSplitter):
         df = df.copy()
         # Build time_col switchback column
         # Overwriting column, this is the worst! If we use the column as a covariate, we're screwed. Needs improvement
-        df[_original_time_column(self.time_col)] = df[self.time_col]
+        # Keep the original time column if it was already stored (this makes the
+        # preparation idempotent, which matters when the observed data was
+        # already produced by this splitter).
+        original_time_col = _original_time_column(self.time_col)
+        if original_time_col not in df.columns:
+            df[original_time_col] = df[self.time_col]
         df[self.time_col] = self._get_time_col_cluster(df)
         return df
 
@@ -218,6 +240,25 @@ class SwitchbackSplitter(ClusteredSplitter):
             cluster_cols=self.cluster_cols,
         )
         return df
+
+    def prepare_observed_df(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Prepare an already-assigned switchback dataframe without re-randomizing.
+
+        It truncates the time column to the switch frequency and applies the
+        washover, exactly as :meth:`assign_treatment_df` does, but keeps the
+        existing ``treatment_col`` values. This guarantees that randomization
+        inference computes the observed statistic on the same rows and columns
+        as each null statistic. The operation is idempotent, so data already
+        produced by :meth:`assign_treatment_df` can be passed as well.
+        """
+        df = df.copy()
+        df = self._prepare_switchback_df(df)
+        return self.washover.washover(
+            df,
+            truncated_time_col=self.time_col,
+            treatment_col=self.treatment_col,
+            cluster_cols=self.cluster_cols,
+        )
 
     @classmethod
     def from_config(cls, config) -> "SwitchbackSplitter":

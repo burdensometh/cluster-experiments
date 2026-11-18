@@ -142,6 +142,55 @@ Results will include treatment effects for each dimension slice.
 
 ---
 
+## 1.4. Randomization Inference
+
+Randomization (permutation) inference tests the sharp null of no effect by
+comparing the observed statistic with the statistics of **legal re-assignments**
+of the treatment. For clustered or switchback experiments you must not shuffle
+single rows independently: the re-assignments must follow the design. Pass the
+same configured splitter that generated the experiment; its cluster-level,
+stratification and washover rules are applied to every re-assignment.
+
+```python
+from cluster_experiments import AnalysisPlan, ClusteredSplitter
+
+# `df` is the dataframe from section 1; group the units into clusters here.
+df["customer_id"] = np.arange(len(df)) % 50
+
+splitter = ClusteredSplitter(
+    cluster_cols=["customer_id"],
+    treatment_col="variant",
+    treatments=["control", "treatment"],
+)
+
+ri_results = plan.randomization_inference(
+    df,
+    splitter=splitter,
+    n_randomizations=200,  # finite; the p-value floor is 1 / (1 + 200)
+    seed=42,
+)
+print(ri_results.to_dataframe()[["metric_alias", "observed_statistic", "p_value"]])
+```
+
+The observed statistic is computed on the observed data prepared by the same
+splitter rules, and every null statistic re-fits the **same analysis
+definition** on a legally re-assigned dataset.
+
+The p-value is based on a finite number of randomizations `R`, treats ties as
+extreme and never reaches zero:
+
+| Hypothesis | p-value rule |
+|-----------|--------------|
+| `greater` | `(1 + #{null >= observed}) / (1 + R)` |
+| `less` | `(1 + #{null <= observed}) / (1 + R)` |
+| `two-sided` | `(1 + \|null\| >= \|observed\|) / (1 + R)` |
+
+Setting `seed` makes the entire run reproducible (the caller's global random
+state is restored afterwards). The same test is available at the single-analysis
+level through `ExperimentAnalysis.get_randomization_inference`.
+
+---
+
 ## 2. Power Analysis
 
 Before running an experiment, it's crucial to know how long it needs to run to detect a significant effect.

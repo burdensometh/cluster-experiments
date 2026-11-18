@@ -15,10 +15,16 @@ from cluster_experiments.experiment_analysis import (
     MLMExperimentAnalysis,
     OLSAnalysis,
     PairedTTestClusteredAnalysis,
+    RandomizationInferenceConfig,
+    RandomizationInferenceResults,
     SyntheticControlAnalysis,
     TTestClusteredAnalysis,
 )
 from cluster_experiments.inference.analysis_plan import AnalysisPlan
+from cluster_experiments.inference.analysis_results import (
+    AnalysisPlanRandomizationInferenceResult,
+    AnalysisPlanRandomizationInferenceResults,
+)
 from cluster_experiments.inference.dimension import Dimension
 from cluster_experiments.inference.hypothesis_test import HypothesisTest
 from cluster_experiments.inference.metric import Metric, RatioMetric, SimpleMetric
@@ -103,4 +109,8 @@ __all__ = [
     "LiftRegressionTransformer",
     "ConfidenceInterval",
     "InferenceResults",
+    "RandomizationInferenceConfig",
+    "RandomizationInferenceResults",
+    "AnalysisPlanRandomizationInferenceResult",
+    "AnalysisPlanRandomizationInferenceResults",
 ]

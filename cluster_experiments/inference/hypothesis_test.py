@@ -1,15 +1,23 @@
 import copy
-from typing import Dict, List, Optional
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional
 
 import pandas as pd
 
 from cluster_experiments.cupac import CupacHandler, MLRateHandler, NoOpHandler
-from cluster_experiments.experiment_analysis import ExperimentAnalysis, InferenceResults
+from cluster_experiments.experiment_analysis import (
+    ExperimentAnalysis,
+    InferenceResults,
+    RandomizationInferenceConfig,
+    RandomizationInferenceResults,
+)
 from cluster_experiments.inference.analysis_results import AnalysisPlanResults
 from cluster_experiments.inference.dimension import DefaultDimension, Dimension
 from cluster_experiments.inference.metric import Metric, RatioMetric
 from cluster_experiments.inference.variant import Variant
 from cluster_experiments.power_config import analysis_mapping
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from cluster_experiments.random_splitter import RandomSplitter
 
 
 class HypothesisTest:
@@ -251,6 +259,105 @@ class HypothesisTest:
         )
 
         return inference_results
+
+    def build_experiment_analysis(
+        self, treatment_col: str, treatment: str
+    ) -> ExperimentAnalysis:
+        """Build a fresh, unfitted analysis instance for one contrast.
+
+        The analysis class and configuration are the same ones used by
+        :meth:`get_test_results`, so randomization inference re-fits the very
+        same estimator on every legal re-assignment.
+        """
+        self._prepare_analysis_config(
+            treatment_col=treatment_col,
+            treatment=treatment,
+        )
+        return self.analysis_class(**self.new_analysis_config)
+
+    def get_randomization_inference(
+        self,
+        control_variant: Variant,
+        treatment_variant: Variant,
+        variant_col: str,
+        exp_data: pd.DataFrame,
+        dimension: Dimension,
+        dimension_value: str,
+        splitter: "RandomSplitter",
+        n_randomizations: int = 500,
+        seed: Optional[int] = None,
+        hypothesis: Optional[str] = None,
+        alpha: float = 0.05,
+        statistic: Optional[Callable[[pd.DataFrame], float]] = None,
+    ) -> RandomizationInferenceResults:
+        """Run randomization inference for this test and dimension slice.
+
+        The observed data is restricted to the contrast and dimension slice, and
+        the same restriction is applied to every legal re-assignment produced by
+        ``splitter``. The analysis class configured on the test is re-fitted on
+        each re-assigned dataset, so the observed and null statistics share the
+        same data preparation and the same analysis definition.
+
+        Parameters
+        ----------
+        control_variant : Variant
+            The control variant.
+        treatment_variant : Variant
+            The treatment variant.
+        variant_col : str
+            The column name representing the variant.
+        exp_data : pd.DataFrame
+            The dataframe containing the data for analysis.
+        dimension : Dimension
+            The dimension instance.
+        dimension_value : str
+            The value of the dimension.
+        splitter : RandomSplitter
+            The configured splitter that defines legal re-assignments.
+        n_randomizations : int
+            Number of finite legal re-assignments to draw.
+        seed : Optional[int]
+            Seed for reproducible randomizations.
+        hypothesis : Optional[str]
+            One of ``"two-sided"``, ``"less"``, ``"greater"``. Defaults to the
+            analysis configuration's hypothesis.
+        alpha : float
+            Significance level stored with the results.
+        statistic : Optional[Callable[[pd.DataFrame], float]]
+            Statistic to compare; defaults to the analysis' point estimate.
+
+        Returns
+        -------
+        RandomizationInferenceResults
+            Observed statistic, null distribution and p-value.
+        """
+        experiment_analysis = self.build_experiment_analysis(
+            treatment_col=variant_col, treatment=treatment_variant.name
+        )
+
+        def prepare_df(frame: pd.DataFrame) -> pd.DataFrame:
+            return self.prepare_data(
+                data=frame,
+                variant_col=variant_col,
+                treatment_variant=treatment_variant,
+                control_variant=control_variant,
+                dimension_name=dimension.name,
+                dimension_value=dimension_value,
+            )
+
+        config = RandomizationInferenceConfig(
+            splitter=splitter,
+            n_randomizations=n_randomizations,
+            seed=seed,
+            hypothesis=hypothesis,
+            control=control_variant.name,
+            statistic=statistic,
+            alpha=alpha,
+            prepare_df=prepare_df,
+        )
+        return experiment_analysis.get_randomization_inference(
+            df=exp_data, config=config, alpha=alpha
+        )
 
     def _prepare_analysis_config(self, treatment_col: str, treatment: str) -> None:
         """

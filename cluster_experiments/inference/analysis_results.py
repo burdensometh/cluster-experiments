@@ -110,3 +110,154 @@ class AnalysisPlanResults:
             df.to_string(index=False),
         ]
         return "\n".join(lines)
+
+
+@dataclass
+class AnalysisPlanRandomizationInferenceResult:
+    """One randomization-inference test produced by
+    :meth:`AnalysisPlan.randomization_inference
+    <cluster_experiments.inference.analysis_plan.AnalysisPlan.randomization_inference>`.
+
+    Each row identifies the hypothesis test (metric, variants, dimension slice)
+    and stores the observed statistic, the finite-randomization p-value and the
+    details needed to audit the rule that produced it.
+
+    Attributes
+    ----------
+    metric_alias : str
+        The alias of the metric used in the test.
+    control_variant_name : str
+        The name of the control variant.
+    treatment_variant_name : str
+        The name of the treatment variant.
+    dimension_name : str
+        The name of the dimension.
+    dimension_value : str
+        The value of the dimension.
+    analysis_type : str
+        The type of analysis fitted on each re-assignment.
+    observed_statistic : float
+        Statistic computed on the observed data.
+    p_value : float
+        Finite-randomization p-value.
+    n_randomizations : int
+        Number of valid legal re-assignments ``R`` used in the denominator.
+    n_extreme : int
+        Number of null statistics at least as extreme (ties included).
+    n_ties : int
+        Number of null statistics exactly equal to the observed one.
+    hypothesis : str
+        One of ``"two-sided"``, ``"less"``, ``"greater"``.
+    alpha : float
+        Significance level stored for reporting purposes.
+    """
+
+    metric_alias: str
+    control_variant_name: str
+    treatment_variant_name: str
+    dimension_name: str
+    dimension_value: str
+    analysis_type: str
+    observed_statistic: float
+    p_value: float
+    n_randomizations: int
+    n_extreme: int
+    n_ties: int
+    hypothesis: str
+    alpha: float
+
+    @property
+    def ate(self) -> float:
+        """Alias for the observed statistic."""
+        return self.observed_statistic
+
+    @property
+    def p_value_rule(self) -> str:
+        """Human-readable statement of the finite-randomization p-value rule."""
+        tail = {
+            "greater": "null statistics >= observed",
+            "less": "null statistics <= observed",
+            "two-sided": "|null statistics| >= |observed|",
+        }[self.hypothesis]
+        return (
+            f"p = (1 + #{{{tail}, ties included}}) / (1 + R) with "
+            f"R = {self.n_randomizations} finite randomizations"
+        )
+
+    def summary(self) -> str:
+        """Return a summary of this randomization-inference test."""
+        return "\n".join(
+            [
+                "Randomization inference result",
+                f"  Metric: {self.metric_alias}",
+                f"  Control: {self.control_variant_name}",
+                f"  Treatment: {self.treatment_variant_name}",
+                f"  Dimension: {self.dimension_name}={self.dimension_value}",
+                f"  Analysis: {self.analysis_type}",
+                f"  Observed statistic: {self.observed_statistic:.6g}",
+                f"  Hypothesis: {self.hypothesis}",
+                f"  Randomizations: {self.n_randomizations}",
+                f"  Extreme (ties included): {self.n_extreme}",
+                f"  Ties: {self.n_ties}",
+                f"  p-value: {self.p_value:.6g}",
+                f"  Rule: {self.p_value_rule}",
+            ]
+        )
+
+
+@dataclass
+class AnalysisPlanRandomizationInferenceResults:
+    """Results of :meth:`AnalysisPlan.randomization_inference`.
+
+    Holds one :class:`AnalysisPlanRandomizationInferenceResult` per hypothesis test and
+    exposes the same tabular helpers as :class:`AnalysisPlanResults`.
+
+    Attributes
+    ----------
+    results : List[AnalysisPlanRandomizationInferenceResult]
+        One entry per metric × variant × dimension slice.
+    """
+
+    results: List[AnalysisPlanRandomizationInferenceResult] = field(
+        default_factory=lambda: []
+    )
+
+    def __add__(
+        self, other: "AnalysisPlanRandomizationInferenceResults"
+    ) -> "AnalysisPlanRandomizationInferenceResults":
+        if not isinstance(other, AnalysisPlanRandomizationInferenceResults):
+            return NotImplemented
+        return AnalysisPlanRandomizationInferenceResults(
+            results=self.results + other.results
+        )
+
+    def __len__(self) -> int:
+        return len(self.results)
+
+    def __str__(self) -> str:
+        n = len(self.results)
+        if n == 0:
+            return "AnalysisPlanRandomizationInferenceResults(0 tests)"
+        p_values = [r.p_value for r in self.results]
+        return (
+            f"AnalysisPlanRandomizationInferenceResults({n} test(s): "
+            f"metrics={[r.metric_alias for r in self.results]}, "
+            f"p-values in [{min(p_values):.4g}, {max(p_values):.4g}])"
+        )
+
+    def to_dataframe(self) -> pd.DataFrame:
+        """Return one row per test with the randomization-inference columns."""
+        return pd.DataFrame([asdict(result) for result in self.results])
+
+    def summary(self) -> str:
+        """Return a summary of the randomization-inference results."""
+        if not self.results:
+            return "Analysis plan randomization inference results: no tests."
+        return "\n".join(
+            [
+                "Analysis plan randomization inference results",
+                f"  Number of tests: {len(self.results)}",
+                "",
+                self.to_dataframe().to_string(index=False),
+            ]
+        )
