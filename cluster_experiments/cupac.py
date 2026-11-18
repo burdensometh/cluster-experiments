@@ -286,13 +286,20 @@ class MLRateHandler:
         features: Optional[List[str]] = None,
         cluster_cols: Optional[List[str]] = None,
         random_state: Optional[int] = None,
+        group_cols: Optional[List[str]] = None,
+        exclude_cols: Optional[List[str]] = None,
     ):
         self.ml_model = ml_model
         self.n_folds = n_folds
         self.target_col = target_col
         self.features = features or []
+        # cluster_cols is kept for backwards compatibility; group_cols lets the
+        # handler key the leakage-safe folds on the source-unit identity when a
+        # resampler introduces independent sampled-unit identities.
         self.cluster_cols = cluster_cols
+        self.group_cols = group_cols if group_cols is not None else cluster_cols
         self.random_state = random_state
+        self.exclude_cols = exclude_cols or []
 
     @property
     def cupac_outcome_name(self) -> str:
@@ -313,7 +320,9 @@ class MLRateHandler:
         return df
 
     def _resolve_feature_cols(self, df: pd.DataFrame) -> List[str]:
-        feature_cols = self.features or [c for c in df.columns if c != self.target_col]
+        excluded = set(self.exclude_cols) | {self.target_col}
+        feature_cols = self.features or [c for c in df.columns if c not in excluded]
+        feature_cols = [c for c in feature_cols if c not in excluded]
         missing = [f for f in feature_cols if f not in df.columns]
         if missing:
             raise ValueError(
@@ -322,12 +331,12 @@ class MLRateHandler:
         return feature_cols
 
     def _make_splits(self, X, y, df: pd.DataFrame):
-        if not self.cluster_cols:
+        if not self.group_cols:
             return KFold(
                 n_splits=self.n_folds, shuffle=True, random_state=self.random_state
             ).split(X, y)
 
-        groups = df[self.cluster_cols].astype(str).apply("_".join, axis=1).values
+        groups = df[self.group_cols].astype(str).apply("_".join, axis=1).values
         n_unique = len(np.unique(groups))
         if n_unique < self.n_folds:
             raise ValueError(
@@ -353,6 +362,8 @@ def build_ml_handler(
     features_cupac_model: Optional[List[str]] = None,
     scale_col: Optional[str] = None,
     cluster_cols: Optional[List[str]] = None,
+    group_cols: Optional[List[str]] = None,
+    exclude_cols: Optional[List[str]] = None,
 ) -> MLHandler:
     """Builds the covariate-injection handler shared by PowerAnalysis and NormalPowerAnalysis."""
     if cupac_model is None:
@@ -364,6 +375,8 @@ def build_ml_handler(
             target_col=target_col,
             features=features_cupac_model or [],
             cluster_cols=cluster_cols,
+            group_cols=group_cols,
+            exclude_cols=exclude_cols,
         )
     return CupacHandler(
         cupac_model=cupac_model,

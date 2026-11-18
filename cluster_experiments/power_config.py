@@ -3,6 +3,7 @@ import logging
 from dataclasses import dataclass
 from typing import List, Literal, Optional, Union
 
+from cluster_experiments.cluster_resampler import ClusterResampler
 from cluster_experiments.cupac import TargetAggregation
 from cluster_experiments.experiment_analysis import (
     ClusteredOLSAnalysis,
@@ -78,6 +79,10 @@ class PowerConfig:
         smoothing_factor: smoothing value to use in the CUPAC model
         features_cupac_model: list of features to use in the CUPAC model
         seed: seed to make the power analysis reproducible
+        resampler: name of the resampler used to bootstrap historical clusters
+            in each simulation (e.g. "cluster_bootstrap"), or "" for no resampling
+        resample_n_units: number of units to draw per simulation when a
+            resampler is used; defaults to the historical number of units
 
     Usage:
 
@@ -104,6 +109,7 @@ class PowerConfig:
     analysis: str
     perturbator: str = ""
     washover: str = ""
+    resampler: str = ""
 
     # Needed
     cluster_cols: Optional[List[str]] = None
@@ -113,6 +119,9 @@ class PowerConfig:
     ml_option: str = "cupac"
     n_folds: int = 5
     scale_col: Optional[str] = None
+
+    # Cluster resampling (bootstrap of historical units)
+    resample_n_units: Optional[int] = None
 
     # Shared
     target_col: str = "target"
@@ -223,6 +232,18 @@ class PowerConfig:
             if self._are_different(self.strata_cols, None):
                 self._set_and_log("strata_cols", None, "splitter")
 
+        if self.resampler not in resampler_mapping:
+            raise ValueError(
+                f"Unknown resampler {self.resampler!r}. "
+                f"Available: {sorted(k for k in resampler_mapping if k)}."
+            )
+        if not self.resampler and self._are_different(self.resample_n_units, None):
+            self._set_and_log("resample_n_units", None, "resampler")
+        elif self.resampler and self.cluster_cols is None:
+            raise MissingArgumentError(
+                "cluster_cols is required when a resampler is used."
+            )
+
         if "stratified" in self.splitter or "balanced" in self.splitter:
             if self._are_different(self.splitter_weights, None):
                 self._set_and_log("splitter_weights", None, "splitter")
@@ -306,6 +327,11 @@ splitter_mapping = {
     "switchback_stratified": StratifiedSwitchbackSplitter,
     "stratified_switchback": StratifiedSwitchbackSplitter,
     "repeated_sampler": RepeatedSampler,
+}
+
+resampler_mapping = {
+    "": None,
+    "cluster_bootstrap": ClusterResampler,
 }
 
 analysis_mapping = {

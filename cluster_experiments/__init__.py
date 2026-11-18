@@ -1,3 +1,4 @@
+from cluster_experiments.cluster_resampler import ClusterResampler
 from cluster_experiments.cupac import (
     EmptyRegressor,
     MLHandler,
@@ -69,6 +70,7 @@ __all__ = [
     "PowerAnalysis",
     "NormalPowerAnalysis",
     "PowerConfig",
+    "ClusterResampler",
     "EmptyRegressor",
     "MLHandler",
     "MLRateHandler",

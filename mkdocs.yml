@@ -61,6 +61,7 @@ nav:
           - Power Config: api/power_config.md
       - Randomization:
           - Splitters: api/random_splitter.md
+          - Cluster Resampler: api/cluster_resampler.md
       - Variance Reduction:
           - CUPAC Model: api/cupac_model.md
       - Switchback:

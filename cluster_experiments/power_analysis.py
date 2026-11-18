@@ -8,6 +8,11 @@ from scipy.stats import norm
 from sklearn.base import BaseEstimator
 from tqdm import tqdm
 
+from cluster_experiments.cluster_resampler import (
+    ClusterResampler,
+    adapt_analysis_for_resampling,
+    adapt_splitter_for_resampling,
+)
 from cluster_experiments.cupac import build_ml_handler
 from cluster_experiments.experiment_analysis import (
     DeltaMethodAnalysis,
@@ -19,9 +24,15 @@ from cluster_experiments.power_config import (
     analysis_mapping,
     cupac_model_mapping,
     perturbator_mapping,
+    resampler_mapping,
     splitter_mapping,
 )
-from cluster_experiments.random_splitter import RandomSplitter, RepeatedSampler
+from cluster_experiments.random_splitter import (
+    NonClusteredSplitter,
+    RandomSplitter,
+    RepeatedSampler,
+    SwitchbackSplitter,
+)
 from cluster_experiments.utils import HypothesisEntries, _get_mapping_key
 
 
@@ -48,6 +59,11 @@ class PowerAnalysis:
         alpha: Significance level.
         features_cupac_model: Covariates to be used in cupac model
         seed: Optional. Seed to use for the splitter.
+        resampler: Optional ClusterResampler. When provided, historical clusters
+            are resampled with replacement in every simulation. Each draw is an
+            independent sampled unit (duplicated draws are not merged), while the
+            source cluster identity is kept for covariate joins and leakage-safe
+            folds.
 
     Usage:
     ```python
@@ -111,7 +127,16 @@ class PowerAnalysis:
         scale_col: Optional[str] = None,
         seed: Optional[int] = None,
         hypothesis: str = "two-sided",
+        resampler: Optional[ClusterResampler] = None,
     ):
+        self.resampler = resampler
+        if resampler is not None:
+            self._check_resampler_support(splitter)
+            # Randomization and inference must happen on the independent sampled
+            # units; the user-provided splitter/analysis are copied, not mutated.
+            splitter = adapt_splitter_for_resampling(splitter, resampler)
+            analysis = adapt_analysis_for_resampling(analysis, resampler)
+
         self.perturbator = perturbator
         self.splitter = splitter
         self.analysis = analysis
@@ -132,6 +157,8 @@ class PowerAnalysis:
             features_cupac_model=features_cupac_model,
             scale_col=scale_col,
             cluster_cols=getattr(splitter, "cluster_cols", None),
+            group_cols=[resampler.source_id_col] if resampler is not None else None,
+            exclude_cols=resampler.identity_cols if resampler is not None else None,
         )
         self.cupac_handler = self.ml_handler  # backward-compat alias
 
@@ -140,6 +167,20 @@ class PowerAnalysis:
             np.random.seed(seed)  # seed for the binary perturbator
 
         self.check_inputs()
+
+    @staticmethod
+    def _check_resampler_support(splitter: RandomSplitter) -> None:
+        if isinstance(splitter, SwitchbackSplitter):
+            raise NotImplementedError(
+                "Cluster resampling is currently supported for non-switchback "
+                "clustered splitters. Switchback splitters overwrite the time "
+                "column and cannot be re-keyed to the resampled unit identity."
+            )
+        if isinstance(splitter, NonClusteredSplitter):
+            raise ValueError(
+                "Cluster resampling requires a clustered splitter; "
+                "NonClusteredSplitter has no cluster units to resample."
+            )
 
     def __repr__(self) -> str:
         """
@@ -212,6 +253,26 @@ class PowerAnalysis:
         ]
         return "\n".join(lines)
 
+    def _prepare_simulation_df(
+        self,
+        df: pd.DataFrame,
+        pre_experiment_df: Optional[pd.DataFrame],
+        draw_index: Optional[int] = None,
+    ) -> pd.DataFrame:
+        """
+        Builds the dataframe used by one simulation draw.
+
+        Without a resampler the covariates are added once upstream, so this is
+        a no-op. With a resampler, historical units are first drawn with
+        replacement (whole within-unit observations replicated, with
+        independent sampled-unit identities) and covariates are then added to
+        the resampled data, so leakage-safe folds can key on the source units.
+        """
+        if self.resampler is None:
+            return df
+        resampled_df = self.resampler.resample(df, draw_index=draw_index)
+        return self.ml_handler.add_covariates(resampled_df, pre_experiment_df)
+
     def _simulate_perturbed_df(
         self,
         df: pd.DataFrame,
@@ -221,11 +282,14 @@ class PowerAnalysis:
         n_simulations: int = 100,
     ) -> Generator[pd.DataFrame, None, None]:
         """Yields splitted + perturbated dataframe for each iteration of the simulation."""
-        df = df.copy()
-        df = self.ml_handler.add_covariates(df, pre_experiment_df)
+        # Without resampling, covariates are added once since rows never change.
+        if self.resampler is None:
+            df = df.copy()
+            df = self.ml_handler.add_covariates(df, pre_experiment_df)
 
-        for _ in tqdm(range(n_simulations), disable=not verbose):
-            yield self._split_and_perturbate(df, average_effect)
+        for i in tqdm(range(n_simulations), disable=not verbose):
+            simulation_df = self._prepare_simulation_df(df, pre_experiment_df, i)
+            yield self._split_and_perturbate(simulation_df, average_effect)
 
     def simulate_pvalue(
         self,
@@ -343,15 +407,22 @@ class PowerAnalysis:
         alpha = self.alpha if alpha is None else alpha
 
         df = df.copy()
-        df = self.ml_handler.add_covariates(df, pre_experiment_df)
+        if self.resampler is None:
+            df = self.ml_handler.add_covariates(df, pre_experiment_df)
 
         if n_jobs == 1:
             return self._non_parallel_loop(
-                df, average_effect, n_simulations, alpha, verbose
+                df, pre_experiment_df, average_effect, n_simulations, alpha, verbose
             )
         elif n_jobs > 1 or n_jobs == -1:
             return self._parallel_loop(
-                df, average_effect, n_simulations, alpha, verbose, n_jobs
+                df,
+                pre_experiment_df,
+                average_effect,
+                n_simulations,
+                alpha,
+                verbose,
+                n_jobs,
             )
         else:
             raise ValueError("n_jobs must be greater than 0, or -1.")
@@ -397,14 +468,21 @@ class PowerAnalysis:
         )
         return perturbed_df
 
-    def _run_simulation(self, args: Tuple[pd.DataFrame, Optional[float]]) -> float:
-        df, average_effect = args
-        perturbed_df = self._split_and_perturbate(df, average_effect)
+    def _run_simulation(
+        self,
+        args: Tuple[pd.DataFrame, Optional[pd.DataFrame], Optional[float], int],
+    ) -> float:
+        df, pre_experiment_df, average_effect, draw_index = args
+        simulation_df = self._prepare_simulation_df(
+            df, pre_experiment_df, draw_index
+        )
+        perturbed_df = self._split_and_perturbate(simulation_df, average_effect)
         return self.analysis.get_pvalue(perturbed_df)
 
     def _non_parallel_loop(
         self,
         df: pd.DataFrame,
+        pre_experiment_df: Optional[pd.DataFrame],
         average_effect: Optional[float],
         n_simulations: int,
         alpha: float,
@@ -414,13 +492,16 @@ class PowerAnalysis:
         Run power analysis by simulation in serial
         Args:
             df: Dataframe with outcome and treatment variables.
+            pre_experiment_df: Dataframe with pre-experiment data.
             average_effect: Average effect of treatment. If None, it will use the perturbator average effect.
             n_simulations: Number of simulations to run.
             alpha: Significance level.
         """
         n_detected_mde = 0
-        for _ in tqdm(range(n_simulations), disable=not verbose):
-            p_value = self._run_simulation((df, average_effect))
+        for i in tqdm(range(n_simulations), disable=not verbose):
+            p_value = self._run_simulation(
+                (df, pre_experiment_df, average_effect, i)
+            )
             if verbose:
                 print(f"p_value of simulation run: {p_value:.3f}")
             n_detected_mde += p_value < alpha
@@ -430,6 +511,7 @@ class PowerAnalysis:
     def _parallel_loop(
         self,
         df: pd.DataFrame,
+        pre_experiment_df: Optional[pd.DataFrame],
         average_effect: Optional[float],
         n_simulations: int,
         alpha: float,
@@ -440,6 +522,7 @@ class PowerAnalysis:
         Run power analysis by simulation in parallel
         Args:
             df: Dataframe with outcome and treatment variables.
+            pre_experiment_df: Dataframe with pre-experiment data.
             average_effect: Average effect of treatment. If None, it will use the perturbator average effect.
             n_simulations: Number of simulations to run.
             alpha: Significance level.
@@ -451,7 +534,12 @@ class PowerAnalysis:
 
         n_detected_mde = 0
         with Pool(processes=n_jobs) as pool:
-            args = [(df, average_effect) for _ in range(n_simulations)]
+            # Each draw carries its index so resampling RNGs stay independent
+            # across forked workers and reproducible across runs.
+            args = [
+                (df, pre_experiment_df, average_effect, i)
+                for i in range(n_simulations)
+            ]
             results = pool.imap_unordered(self._run_simulation, args)
             for p_value in tqdm(results, total=n_simulations, disable=not verbose):
                 n_detected_mde += p_value < alpha
@@ -518,6 +606,7 @@ class PowerAnalysis:
         splitter_cls = _get_mapping_key(splitter_mapping, config.splitter)
         analysis_cls = _get_mapping_key(analysis_mapping, config.analysis)
         cupac_model = _resolve_cupac_model(config)
+        resampler = _resolve_resampler(config)
 
         return cls(
             perturbator=perturbator_cls.from_config(config),
@@ -536,6 +625,7 @@ class PowerAnalysis:
             seed=config.seed,
             hypothesis=config.hypothesis,
             scale_col=config.scale_col,
+            resampler=resampler,
         )
 
     def check_treatment_col(self):
@@ -693,6 +783,11 @@ class NormalPowerAnalysis:
         alpha: Significance level.
         features_cupac_model: Covariates to be used in cupac model
         seed: Optional. Seed to use for the splitter.
+        time_col: Optional time column.
+        resampler: Optional ClusterResampler. When provided, historical clusters
+            are resampled with replacement in every simulation, with independent
+            sampled-unit identities and preserved source identities for
+            covariate joins and leakage-safe folds.
 
     Usage:
     ```python
@@ -767,7 +862,14 @@ class NormalPowerAnalysis:
         seed: Optional[int] = None,
         hypothesis: str = "two-sided",
         time_col: Optional[str] = None,
+        resampler: Optional[ClusterResampler] = None,
     ):
+        self.resampler = resampler
+        if resampler is not None:
+            self._check_resampler_support(splitter)
+            splitter = adapt_splitter_for_resampling(splitter, resampler)
+            analysis = adapt_analysis_for_resampling(analysis, resampler)
+
         self.splitter = splitter
         self.analysis = analysis
         self.n_simulations = n_simulations
@@ -788,6 +890,8 @@ class NormalPowerAnalysis:
             features_cupac_model=features_cupac_model,
             scale_col=scale_col,
             cluster_cols=getattr(splitter, "cluster_cols", None),
+            group_cols=[resampler.source_id_col] if resampler is not None else None,
+            exclude_cols=resampler.identity_cols if resampler is not None else None,
         )
         self.cupac_handler = self.ml_handler  # backward-compat alias
 
@@ -851,14 +955,42 @@ class NormalPowerAnalysis:
         )
         return treatment_df
 
+    @staticmethod
+    def _check_resampler_support(splitter: RandomSplitter) -> None:
+        if isinstance(splitter, SwitchbackSplitter):
+            raise NotImplementedError(
+                "Cluster resampling is currently supported for non-switchback "
+                "clustered splitters. Switchback splitters overwrite the time "
+                "column and cannot be re-keyed to the resampled unit identity."
+            )
+        if isinstance(splitter, NonClusteredSplitter):
+            raise ValueError(
+                "Cluster resampling requires a clustered splitter; "
+                "NonClusteredSplitter has no cluster units to resample."
+            )
+
+    def _prepare_simulation_df(
+        self,
+        df: pd.DataFrame,
+        pre_experiment_df: Optional[pd.DataFrame],
+        draw_index: Optional[int] = None,
+    ) -> pd.DataFrame:
+        """Resamples historical units per draw, then adds covariates on the resampled data."""
+        if self.resampler is None:
+            return df
+        resampled_df = self.resampler.resample(df, draw_index=draw_index)
+        return self.ml_handler.add_covariates(resampled_df, pre_experiment_df)
+
     def _get_standard_error(
         self,
         df: pd.DataFrame,
         n_simulations: int,
         verbose: bool,
+        pre_experiment_df: Optional[pd.DataFrame] = None,
     ) -> Generator[float, None, None]:
-        for _ in tqdm(range(n_simulations), disable=not verbose):
-            split_df = self._split(df)
+        for i in tqdm(range(n_simulations), disable=not verbose):
+            simulation_df = self._prepare_simulation_df(df, pre_experiment_df, i)
+            split_df = self._split(simulation_df)
             yield self.analysis.get_standard_error(split_df)
 
     def _normal_power_calculation(
@@ -1004,9 +1136,14 @@ class NormalPowerAnalysis:
         n_simulations = self.n_simulations if n_simulations is None else n_simulations
 
         df = df.copy()
-        df = self.ml_handler.add_covariates(df, pre_experiment_df)
+        if self.resampler is None:
+            df = self.ml_handler.add_covariates(df, pre_experiment_df)
 
-        std_errors = list(self._get_standard_error(df, n_simulations, verbose))
+        std_errors = list(
+            self._get_standard_error(
+                df, n_simulations, verbose, pre_experiment_df=pre_experiment_df
+            )
+        )
         std_error_mean = float(np.mean(std_errors))
 
         return std_error_mean
@@ -1359,6 +1496,7 @@ class NormalPowerAnalysis:
         splitter_cls = _get_mapping_key(splitter_mapping, config.splitter)
         analysis_cls = _get_mapping_key(analysis_mapping, config.analysis)
         cupac_model = _resolve_cupac_model(config)
+        resampler = _resolve_resampler(config)
 
         return cls(
             splitter=splitter_cls.from_config(config),
@@ -1377,6 +1515,7 @@ class NormalPowerAnalysis:
             hypothesis=config.hypothesis,
             time_col=config.time_col,
             scale_col=config.scale_col,
+            resampler=resampler,
         )
 
     def check_treatment_col(self):
@@ -1481,3 +1620,11 @@ def _resolve_cupac_model(config: PowerConfig) -> Optional[BaseEstimator]:
     if config.ml_option == "mlrate":
         return cupac_cls()
     return cupac_cls.from_config(config)
+
+
+def _resolve_resampler(config: PowerConfig) -> Optional[ClusterResampler]:
+    """Builds the ClusterResampler a PowerConfig points to, or None if unconfigured."""
+    if not config.resampler:
+        return None
+    resampler_cls = _get_mapping_key(resampler_mapping, config.resampler)
+    return resampler_cls.from_config(config)
